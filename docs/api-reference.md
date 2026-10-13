@@ -1167,6 +1167,148 @@ Local smoke test (local bindings only, never remote):
 unscoped. Additive; the header rollback revokes every scoped key, drops the
 column and deletes the `0012_api_key_scopes.sql` row from `d1_migrations`.
 
+### Changing release and publisher state
+
+Behind the same flag (`404 not_found` unless `SKILLX_RELEASES_API` is `"1"`
+or `"true"`; other methods `405`).
+
+| Endpoint | Who |
+|----------|-----|
+| `POST /api/v1/packages/@{publisher}/{slug}/releases/{version}/state` | The package owner (owner of its publisher) or an admin |
+| `POST /api/v1/publishers/@{handle}/state` | Admin only |
+
+**Request**: `Content-Type: application/json`, at most 4 KiB:
+`{"from": "<expected state>", "to": "<new state>", "reason": "<optional>"}`.
+Unknown members are rejected. `reason` is 1 to 512 UTF-8 bytes without
+control, format (bidi) or line separator characters (the
+`skillx.release-status/v1` reason rules).
+
+**Auth**: admin with `X-Admin-Secret: <ADMIN_SECRET>` (the existing admin
+pattern; a present but wrong or unconfigured secret is `401
+invalid_admin_secret`, never a fall back). Otherwise the caller is the read
+API viewer: `Authorization: Bearer sx_...` with an unscoped account key, or
+the web session. Scoped `releases:publish:@handle` keys are publish-only and
+answer `401 invalid_api_key`, so a leaked CI publish key cannot yank.
+
+**Rate limit**: once the actor is known, every request (admin included, as
+the single caller `user:admin`) counts against `RELEASE_READ_LIMITER`, the
+same 300 per 60 seconds per caller as the read API, before any D1 write. A
+limited request answers `429 rate_limited` with `Retry-After` and writes no
+audit row. This bounds audit growth per caller but does not stop it: the
+limit is counted per Cloudflare location, and a missing or failing binding
+lets the request through.
+
+**Compare-and-set**: the change applies only while the row is still in
+`from`; otherwise `409 state_conflict` (re-read and retry). Two concurrent
+changes from the same state (for example a yank and a quarantine) produce
+exactly one winner; the other gets `409`.
+
+**Release transitions**: every applied (audited) edge is an edge of the
+signed status graph, so every history can later be issued as
+`skillx.release-status/v1` documents:
+
+| From | To | Owner | Admin |
+|------|----|-------|-------|
+| `draft` | `published` (needs a tree digest and signed manifest, else `422 release.incomplete`) | yes | yes |
+| `published` | `yanked` | yes | yes |
+| `published` | `quarantined` | no | yes |
+| `quarantined` | `yanked` (lifts a quarantine) | no | yes |
+| `yanked` | `published` | no | yes |
+| `yanked` | `quarantined` (containment composite, below) | no | yes |
+
+Lifting a quarantine is two steps (`quarantined` to `yanked` to `published`),
+and nothing returns to `draft`. Any other pair, or `from` equal to `to`, is
+`422 transition.invalid`. Checks run in this order for an owner: ownership,
+then publisher standing (an owner of a `suspended` or `revoked` publisher
+gets `403 publisher_revoked`, whatever the pair), then the pair, then
+admin-only edges. The publisher standing is checked again inside the
+compare-and-set batch, so a suspension that lands mid-request still refuses
+the change (`403 publisher_revoked`, audited `denied`).
+
+**Containing a yanked release**: `yanked` to `quarantined` is not an edge of
+the v1 contract graph, but a yanked release is still served by digest to
+existing lockfiles, so an admin must be able to contain it. The server applies
+the path `yanked` to `published` to `quarantined` in one atomic D1 batch,
+under the same compare-and-set on `yanked`, and writes one `applied` audit row
+per edge (both, or none; a lost race leaves one `stale` row of the requested
+pair). No reader ever sees it `published`; the response reports
+`"from": "yanked", "to": "quarantined"`. Owners get `403
+transition.admin_only`. A future status issuer must advance the signed
+`sequence` by 2 for this change (the v1 rule accepts a state reachable in at
+most the sequence gap). Do not reproduce it as two separate requests: between
+them the version is installable.
+
+**Several quarantined releases of one tree**: quarantine judges the bytes, so
+every read of a tree digest is `403 release_quarantined` while any release
+with that digest, in any package, is quarantined. Lifting one of them leaves
+the tree blocked until all are lifted.
+
+**Publisher transitions** (admin only): `active` to `suspended`, `suspended`
+to `active` (reinstate) or `revoked`; `revoked` is final. A suspended or
+revoked publisher's releases answer `403 publisher_revoked` on every read
+endpoint and its uploads `403 publisher.inactive`.
+
+**Invariants**: only `release_state` (or `publishers.state`) and the matching
+timestamp change (`published_at` keeps the first publication; `yanked_at`
+and `quarantined_at` record the last entry). Bytes, digests, R2 objects and
+manifests never change, and the version still cannot receive another tree
+(`409 release.version_exists` on upload). Nothing is deleted.
+
+**Audit**: every attempt by an authenticated actor on an existing release or
+publisher that passes the rate limit writes one `release_state_audit` row
+(two for an applied containment composite; actor kind and id, expected
+`from`, `to`, outcome `applied`, `stale`, `denied` or `invalid`, reason,
+time), in the same D1 batch as the change, so a lost compare-and-set is
+recorded too. The admin actor id is `admin` (the shared secret carries no
+individual identity). The table is append-only: triggers abort any `UPDATE`
+or `DELETE`.
+
+**Signed status**: transitions do not yet issue or re-sign
+`skillx.release-status/v1` documents and leave `status_sequence` unchanged;
+issuing them is a follow-up.
+
+**Response** `200` (`Cache-Control: no-store`):
+
+```json
+{
+  "identity": "@acme/demo",
+  "version": "1.0.0",
+  "releaseDigest": "sha256:...",
+  "from": "published",
+  "to": "yanked",
+  "state": "yanked",
+  "changedAt": "2026-10-13T12:00:00.000Z"
+}
+```
+
+The publisher route answers `{"handle", "from", "to", "state", "changedAt"}`.
+
+**Errors** (`{"error": {"code", "message"}}`, `no-store`):
+
+| Status | Codes |
+|--------|-------|
+| 400 | `invalid_request` (body, states, reason), `identity.invalid`, `invalid_version` |
+| 401 | `auth.required`, `invalid_api_key`, `invalid_admin_secret` (with `WWW-Authenticate: Bearer`) |
+| 403 | `transition.not_owner` (public package), `transition.admin_only`, `publisher_revoked` |
+| 404 | `not_found` (unknown release or publisher; a private package of another owner; API disabled) |
+| 409 | `state_conflict` |
+| 413 | `request_too_large` |
+| 415 | `unsupported_media_type` |
+| 422 | `transition.invalid`, `release.incomplete` |
+| 429 | `rate_limited` (with `Retry-After`) |
+| 500 | `release.internal_error` |
+
+### Database table (migration `0013_release_state_audit`)
+
+`release_state_audit`: `id`, `subject_kind` (`release` or `publisher`),
+`subject_id`, `actor_kind` (`admin` or `user`), `actor_id`, `from_state`,
+`to_state`, `outcome`, `reason`, `created_at`, index
+`idx_release_state_audit_subject`, and triggers
+`release_state_audit_no_update` / `release_state_audit_no_delete`. No foreign
+keys, so the history outlives its subject. Additive; the header rollback drops
+the triggers, index and table and deletes the `0013_release_state_audit.sql`
+row from `d1_migrations`.
+
 ---
 
 ## Error Format
@@ -1182,7 +1324,7 @@ All error responses follow a consistent shape:
 
 ## Rate Limits
 
-No explicit rate limiting at the API layer, except the release read API (300 requests per minute per caller, `429` with `Retry-After`; see [Reading releases](#reading-releases-pinned-whole-tree-read-api)). Cloudflare Workers handles DDoS protection. Search results cached in KV (5min TTL) for performance.
+No explicit rate limiting at the API layer, except the release read and release state APIs (300 requests per minute per caller, `429` with `Retry-After`; see [Reading releases](#reading-releases-pinned-whole-tree-read-api)). Cloudflare Workers handles DDoS protection. Search results cached in KV (5min TTL) for performance.
 
 ## Source Files
 
@@ -1200,6 +1342,7 @@ No explicit rate limiting at the API layer, except the release read API (300 req
 | `apps/web/app/routes/api.v1.package-releases.ts` | Release listing (GET) and publish (POST, action re-exported) on one path |
 | `apps/web/app/routes/api.v1.release-{manifest,file,artifact}.ts` | Pinned release reads (flagged) |
 | `apps/web/app/routes/api.v1.signing-keys.ts` | Registry key IDs (flagged) |
-| `apps/web/app/lib/releases/` | Release ingest, signing, scan, R2 and D1 writes; read access, rate limit and read handlers |
+| `apps/web/app/routes/api.v1.release-state.ts` | Release and publisher state transitions (flagged) |
+| `apps/web/app/lib/releases/` | Release ingest, signing, scan, R2 and D1 writes; read access, rate limit and read handlers; state transitions (`release-transitions.ts`, `release-state-http.ts`) |
 | `apps/web/app/routes/api.admin.seed.ts` | Admin data seeding |
 | `apps/web/app/routes/auth-catchall.tsx` | Better Auth handler |

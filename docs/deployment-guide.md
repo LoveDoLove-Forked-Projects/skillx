@@ -40,13 +40,17 @@ GITHUB_CLIENT_SECRET=your_github_oauth_client_secret
 ENVIRONMENT=development
 ```
 
-For production, use Cloudflare Secrets:
+For production, use Cloudflare Secrets. `wrangler.jsonc` declares no named
+environments: the production worker is `skillx-web` itself, so wrangler
+commands below target it by name (`--name skillx-web`) or, for D1, with
+`--remote`. Never pass `--env`/`--environment`; that targets a separate
+`skillx-web-production` worker.
 
 ```bash
 # Set secrets on production Worker
-wrangler secret put BETTER_AUTH_SECRET --env production
-wrangler secret put GITHUB_CLIENT_ID --env production
-wrangler secret put GITHUB_CLIENT_SECRET --env production
+wrangler secret put BETTER_AUTH_SECRET --name skillx-web
+wrangler secret put GITHUB_CLIENT_ID --name skillx-web
+wrangler secret put GITHUB_CLIENT_SECRET --name skillx-web
 ```
 
 ## Local Development
@@ -95,7 +99,7 @@ pnpm test
 
 ```bash
 # Create production database
-wrangler d1 create skillx-db --environment production
+wrangler d1 create skillx-db
 
 # Returns:
 # [[d1_databases]]
@@ -125,7 +129,7 @@ Update `apps/web/wrangler.jsonc`:
 
 ```bash
 # Create production KV
-wrangler kv:namespace create skillx-cache --environment production
+wrangler kv:namespace create skillx-cache
 
 # Returns:
 # [[kv_namespaces]]
@@ -139,7 +143,7 @@ wrangler kv:namespace create skillx-cache --environment production
 
 ```bash
 # Create production Vectorize
-wrangler vectorize create skillx-skills --environment production
+wrangler vectorize create skillx-skills
 
 # Add to wrangler.jsonc:
 # [[vectorize]]
@@ -165,17 +169,17 @@ wrangler r2 bucket create skillx-assets
 
 ```bash
 # Apply all migrations to production D1
-wrangler d1 migrations apply skillx-db --environment production
+wrangler d1 migrations apply skillx-db --remote
 
 # Verify
-wrangler d1 execute skillx-db --environment production --command "SELECT COUNT(*) FROM skills"
+wrangler d1 execute skillx-db --remote --command "SELECT COUNT(*) FROM skills"
 ```
 
 #### Seed Production Data
 
 ```bash
 # Get production Worker URL
-WORKER_URL=$(wrangler deployments list --env production | grep -oP 'https://[^ ]+')
+WORKER_URL=$(wrangler deployments list --name skillx-web | grep -oP 'https://[^ ]+')
 
 # Seed skills
 curl -X POST $WORKER_URL/api/admin/seed
@@ -188,15 +192,15 @@ curl $WORKER_URL/api/search?query=vercel
 
 ```bash
 # Set authentication secrets
-wrangler secret put BETTER_AUTH_SECRET --environment production
+wrangler secret put BETTER_AUTH_SECRET --name skillx-web
 # Enter secret value (e.g., 64 random hex chars)
 
 # Set GitHub OAuth credentials
-wrangler secret put GITHUB_CLIENT_ID --environment production
-wrangler secret put GITHUB_CLIENT_SECRET --environment production
+wrangler secret put GITHUB_CLIENT_ID --name skillx-web
+wrangler secret put GITHUB_CLIENT_SECRET --name skillx-web
 
 # Verify secrets are set
-wrangler secret list --environment production
+wrangler secret list --name skillx-web
 ```
 
 #### Release publishing (off by default)
@@ -269,6 +273,68 @@ var to about `600`; uploads above roughly 580 distinct files are then refused.
 
 Stored R2 objects and release rows are immutable and stay in place.
 
+#### Release API activation runbook
+
+Run this supervised, by a maintainer, in order. Stop at the first failure.
+
+1. **Back up D1.** Record a Time Travel bookmark (and optionally export a dump):
+   ```bash
+   cd apps/web
+   wrangler d1 time-travel info skillx-db          # note the bookmark
+   wrangler d1 export skillx-db --remote --output=backup-$(date +%Y%m%d%H%M).sql
+   ```
+   Keep the dump outside the repository; it contains user data.
+2. **Apply migrations 0012 and 0013 remotely.** `0012_api_key_scopes` adds
+   `api_keys.scopes`; `0013_release_state_audit` adds the append-only
+   `release_state_audit` table and its two triggers. Both are additive.
+   ```bash
+   pnpm run db:migrate:remote
+   wrangler d1 execute skillx-db --remote \
+     --command "SELECT name FROM d1_migrations ORDER BY id DESC LIMIT 2"
+   ```
+   Confirm both names are listed.
+3. **Deploy** with the flag still `"0"`: `pnpm run deploy`. Check that
+   `GET /api/v1/packages/@agentkit/x/releases` answers `404`.
+4. **Enable.** Set `SKILLX_RELEASES_API` to `"1"` in `apps/web/wrangler.jsonc`
+   and deploy again.
+5. **Supervised smoke** with a throwaway skill of a test publisher:
+   - publish one release through `publish-release.yml` (or `skillx release`
+     with a scoped key) and expect `200` with `"created": true` and the
+     signed manifest (a replay of the same tree answers `200` with
+     `"created": false`);
+   - list, fetch the manifest, one file and the artifact; recompute the tree
+     digest locally and compare it with `releaseDigest`;
+   - yank it with the owner's account key
+     (`POST .../releases/<version>/state`,
+     `{"from":"published","to":"yanked","reason":"activation smoke"}`), then
+     replay the same body and expect `409 state_conflict`;
+   - confirm the audit rows:
+     `SELECT outcome, from_state, to_state FROM release_state_audit ORDER BY created_at DESC, rowid DESC LIMIT 5`.
+   The smoke release stays yanked; nothing is deleted.
+
+**Containing a yanked release** (for example malware found after a yank;
+a yanked release is still served by digest to existing lockfiles): as admin,
+send `{"from":"yanked","to":"quarantined","reason":"..."}` to
+`POST .../releases/<version>/state` with `X-Admin-Secret`. The server applies
+`yanked -> published -> quarantined` in one D1 batch and writes two `applied`
+audit rows, so the release is never resolvable as `published` in between. Do
+not run the two steps as separate requests: between them the version is
+installable. Quarantine judges the bytes: if several releases (in any package)
+share a quarantined tree digest, every read of that tree stays
+`403 release_quarantined` until each of those releases is lifted.
+
+**Rate limit.** The state endpoint counts every request against
+`RELEASE_READ_LIMITER` (300 per 60 s per caller; the admin secret counts as
+one caller, `user:admin`) before any D1 write. A limited request answers
+`429 rate_limited` with `Retry-After` and writes no audit row.
+
+**Rollback of 0013**: disable the flag and redeploy first (the state endpoint
+then answers 404), then run the rollback SQL in the header of
+`0013_release_state_audit.sql` (drops the triggers, index and table, clears
+the `d1_migrations` row). Dropping the table discards the audit trail; export
+it first. Restore from the Time Travel bookmark only when data, not only
+schema, must be reverted.
+
 ### Phase 4: Domain & SSL Setup
 
 ```bash
@@ -294,7 +360,7 @@ cd apps/web
 pnpm build
 
 # Deploy Worker
-wrangler deploy --env production
+wrangler deploy --name skillx-web
 
 # Output shows:
 # Deployed to https://skillx.sh
@@ -307,7 +373,7 @@ curl https://skillx.sh
 
 ```bash
 # Check Worker status
-wrangler deployments list --env production
+wrangler deployments list --name skillx-web
 
 # Test search endpoint
 curl https://skillx.sh/api/search?query=test
@@ -324,15 +390,15 @@ If production has issues:
 
 ```bash
 # View recent deployments
-wrangler deployments list --env production
+wrangler deployments list --name skillx-web
 
 # Rollback to previous version
-wrangler rollback --env production
+wrangler rollback --name skillx-web
 
 # Or redeploy from specific git commit
 git checkout LAST_GOOD_COMMIT
 pnpm build
-wrangler deploy --env production
+wrangler deploy --name skillx-web
 ```
 
 ---
@@ -363,7 +429,7 @@ GITHUB_CLIENT_SECRET=[secret]
 
 ```bash
 # Stream Worker logs
-wrangler tail --env production
+wrangler tail skillx-web
 
 # Example output:
 # ┌─ 2025-02-12 10:15:30 [GET] /api/search
@@ -383,7 +449,7 @@ open https://dash.cloudflare.com/
 
 ```bash
 # Query D1 stats
-wrangler d1 insights --env production
+wrangler d1 insights skillx-db
 
 # Returns:
 # Query count: 1,234
@@ -417,7 +483,7 @@ git commit -m "feat: add skill tags"
 
 # Deploy
 pnpm build
-wrangler deploy --env production
+wrangler deploy --name skillx-web
 
 # Verify
 curl https://skillx.sh/api/search?query=test
@@ -430,7 +496,7 @@ curl https://skillx.sh/api/search?query=test
 echo "NEW_VAR=value" >> .dev.vars
 
 # Add to production
-wrangler secret put NEW_VAR --environment production
+wrangler secret put NEW_VAR --name skillx-web
 # Enter value
 
 # Update code to use env.NEW_VAR
@@ -441,10 +507,10 @@ wrangler secret put NEW_VAR --environment production
 
 ```bash
 # Export D1 database
-wrangler d1 execute skillx-db --environment production --json --command "SELECT * FROM skills LIMIT 1000" > backup.json
+wrangler d1 execute skillx-db --remote --json --command "SELECT * FROM skills LIMIT 1000" > backup.json
 
 # Restore from backup (if needed)
-# wrangler d1 execute skillx-db --environment production < backup.sql
+# wrangler d1 execute skillx-db --remote --file=backup.sql
 ```
 
 ---
