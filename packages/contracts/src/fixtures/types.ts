@@ -20,7 +20,9 @@ export type FixtureGroup =
   | "collection-member"
   | "entitlement"
   | "listing-import"
-  | "release-publish";
+  | "release-publish"
+  | "release-manifest"
+  | "release-status";
 
 /** A syntactically valid digest used by fixtures. */
 export const FIXTURE_DIGEST = `sha256:${"a".repeat(64)}`;

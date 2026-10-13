@@ -1,5 +1,10 @@
 /**
  * The single shared validator fixture set for `skillx.package/v1` and siblings.
+ *
+ * The signed-release fixtures (`release-fixtures.ts`,
+ * `release-status-fixtures.ts`) are deliberately not re-exported here: this
+ * module is part of the package root that Worker code bundles, and those
+ * fixtures exist only for tests, which import them directly.
  */
 
 import {
