@@ -13,6 +13,13 @@ declare global {
     SKILLX_REGISTRY_SIGNING_KEY?: string;
     /** Published ID of the registry signing key. */
     SKILLX_REGISTRY_SIGNING_KEY_ID?: string;
+    /**
+     * Comma-separated revoked registry key IDs listed by GET /api/v1/keys. Set it as a
+     * secret (`wrangler secret put SKILLX_REGISTRY_REVOKED_KEY_IDS --name skillx-web`), not
+     * as a wrangler.jsonc var or a dashboard plain var: a deploy removes dashboard plain
+     * vars that are missing from the config, and only secrets survive it.
+     */
+    SKILLX_REGISTRY_REVOKED_KEY_IDS?: string;
   }
 }
 
