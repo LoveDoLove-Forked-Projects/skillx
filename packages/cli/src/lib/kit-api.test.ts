@@ -41,6 +41,14 @@ describe('kit API client', () => {
     expect(calls[1]).toMatchObject({ url: 'https://skillx.test/api/v1/kits/@alpha/my-kit/rollback', body: { revisionId: 'pkr_2', approval: { revisionDigest: 'sha256:ab' } } });
   });
 
+  it('validates and submits proposals, and offers no API-key review', async () => {
+    await kitApi.validateProposal('@alpha/my-kit', { schema: 'skillx.kit-proposal/v1' });
+    await kitApi.submitProposal('@alpha/my-kit', { schema: 'skillx.kit-proposal/v1' }, 2, 'idem-key-0004');
+    expect(calls.map((c) => c.url.replace('https://skillx.test/api/v1/kits/@alpha/my-kit/', ''))).toEqual(['proposals/validate', 'proposals']);
+    expect(calls[0]!.body).toEqual({ proposal: { schema: 'skillx.kit-proposal/v1' } });
+    expect('reviewProposal' in kitApi).toBe(false);
+  });
+
   it('refuses malformed kit names before any request and surfaces API errors', async () => {
     expect(() => kitApi.get('../etc')).toThrow(/invalid kit name/);
     reply = () => new Response(JSON.stringify({ error: { code: 'kit.generation_conflict' } }), { status: 409 });

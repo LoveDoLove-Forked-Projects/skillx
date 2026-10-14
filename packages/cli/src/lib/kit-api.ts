@@ -59,6 +59,16 @@ export const kitApi = {
       revisionId: revision.id,
       approval: { revisionDigest: revision.digest },
     }),
+  /** Dry-run of a `skillx.kit-proposal/v1` envelope: every server check, nothing stored. */
+  validateProposal: (kit: string, proposal: unknown, expectedGeneration?: number) =>
+    post<{ valid: true; state: 'proposed' | 'quarantined'; revisionDigest: string; requiredPermissions: string[]; findings: string[]; generationConflict: boolean }>(
+      kit,
+      'proposals/validate',
+      { proposal, ...(expectedGeneration === undefined ? {} : { expectedGeneration }) },
+    ),
+  submitProposal: (kit: string, proposal: unknown, expectedGeneration: number, idempotencyKey: string) =>
+    post<StoredRevision>(kit, 'proposals', { expectedGeneration, idempotencyKey, proposal }),
+  // Review and activation of a proposal need the owner's web session; an API key cannot approve.
   lock: (kit: string, revisionId?: string) =>
     apiRequest<{ lock: unknown; documents: unknown[]; warnings: string[] }>(kitPath(kit, revisionId ? `lock?revision=${encodeURIComponent(revisionId)}` : 'lock')),
 };
