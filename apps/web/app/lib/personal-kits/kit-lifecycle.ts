@@ -4,8 +4,11 @@
  * exact `revisionDigest`, re-checks every base of the effective lineage and
  * moves `effective_revision_id` under the generation guard; nothing becomes
  * effective implicitly. A proposal (`proposed`) must be reviewed first, and
- * a session-derived revision activates only on a private kit and only from
- * an interactive web session. A quarantined revision anywhere in the chain
+ * a revision with a session-derived revision anywhere in its history (its
+ * revision chain, any origin, and the revision chain of every parent revision
+ * its document lineage names; an unreadable parent counts) activates only on a private kit,
+ * as a private document, and only from an interactive web session. Any
+ * activation that makes a kit public needs a web session too. A quarantined revision anywhere in the chain
  * fails the lock with `kit.locked_incompatible`.
  * Rejection is final for that revision; a proposal is rejected only through
  * its web-session review, never through the generic reject. The lock is derived on read from the
@@ -20,6 +23,7 @@ import type { KitCaller } from "./kit-http";
 import { commitKitMutation, documentOf, getRevision, ownedKit, writableKit } from "./kit-store";
 import type { KitRow, RevisionRow } from "./kit-store";
 import { chainView, loadChain } from "./kit-verify";
+import type { LoadedChain } from "./kit-verify";
 import { generationConflict } from "./kit-revisions";
 
 const ACTIVATABLE = new Set(["draft", "reviewed"]);
@@ -27,6 +31,8 @@ const ACTIVATABLE = new Set(["draft", "reviewed"]);
 interface LockCheck {
   /** Null when the lineage is incomplete; `reasons` then says why. */
   lock: Awaited<ReturnType<typeof buildKitLock>> | null;
+  /** The parent revisions the document lineage loaded. */
+  parents: LoadedChain["parents"];
   documents: unknown[];
   reasons: string[];
   warnings: string[];
@@ -36,7 +42,7 @@ interface LockCheck {
 export async function checkLock(caller: KitCaller, rev: RevisionRow): Promise<LockCheck> {
   const reasons: string[] = rev.state === "quarantined" ? ["the revision is quarantined"] : [];
   const loaded = await loadChain(caller, documentOf(rev), reasons);
-  if (loaded.incomplete) return { lock: null, documents: [], reasons, warnings: [] };
+  if (loaded.incomplete) return { lock: null, parents: loaded.parents, documents: [], reasons, warnings: [] };
   const { chain } = loaded;
   const warnings: string[] = [];
   for (const { entry } of resolveLineage(chain)) {
@@ -50,7 +56,7 @@ export async function checkLock(caller: KitCaller, rev: RevisionRow): Promise<Lo
     }
   }
   const lock = await buildKitLock(chain, { id: rev.id, number: Number(rev.revision_number), digest: rev.revision_digest });
-  return { lock, documents: chainView(loaded), reasons, warnings };
+  return { lock, parents: loaded.parents, documents: chainView(loaded), reasons, warnings };
 }
 
 /** 409 with the failing pins listed in `error.reasons`. */
@@ -62,6 +68,30 @@ function requireApproval(raw: unknown, rev: RevisionRow): void {
   if (digest !== rev.revision_digest) throw conflict("kit.approval_required", "approval.revisionDigest must name the exact revision being activated");
 }
 
+/**
+ * True when `rev` or any revision in its parent chain, whatever its origin,
+ * is session-derived: it inherits the web-session activation gate. A parent
+ * that cannot be read (missing, or in another kit) counts as session-derived,
+ * so the check fails closed.
+ */
+async function derivesFromSession(db: D1Database, kitId: string, rev: RevisionRow): Promise<boolean> {
+  if (rev.origin === "session-derived") return true;
+  const row = await db
+    .prepare(
+      `WITH RECURSIVE chain(id, origin, parent) AS (
+         SELECT id, origin, parent_revision_id FROM personal_kit_revisions WHERE id = ? AND kit_id = ?
+         UNION
+         SELECT r.id, r.origin, r.parent_revision_id FROM personal_kit_revisions r JOIN chain c ON r.id = c.parent WHERE r.kit_id = ?)
+       SELECT COUNT(*) AS n,
+              COALESCE(SUM(origin = 'session-derived'), 0) AS tainted,
+              COALESCE(SUM(parent IS NOT NULL AND parent NOT IN (SELECT id FROM chain)), 0) AS dangling
+         FROM chain`,
+    )
+    .bind(rev.id, kitId, kitId)
+    .first<{ n: number; tainted: number; dangling: number }>();
+  return row === null || Number(row.n) === 0 || Number(row.tainted) > 0 || Number(row.dangling) > 0;
+}
+
 /** `POST .../activate` and `POST .../rollback` (rollback: a revision that was effective before). */
 export async function activateRevision(caller: KitCaller, kitName: string, body: Record<string, unknown>, generation: number, rollback: boolean): Promise<Response> {
   const kit = await writableKit(caller.env.DB, kitName, caller.userId);
@@ -71,17 +101,26 @@ export async function activateRevision(caller: KitCaller, kitName: string, body:
   if (rev.state === "proposed") throw conflict("kit.review_required", "a proposed revision must be reviewed before activation");
   if (!ACTIVATABLE.has(rev.state)) throw conflict("kit.revision_unusable", `the revision is ${rev.state}`);
   const sessionDerived = rev.origin === "session-derived";
-  if (sessionDerived) {
-    if (rev.state !== "reviewed") throw conflict("kit.review_required", "a session-derived revision must be reviewed");
+  if (sessionDerived && rev.state !== "reviewed") throw conflict("kit.review_required", "a session-derived revision must be reviewed");
+  const doc = documentOf(rev);
+  // The lock loads the document lineage: a parent revision in another kit carries its own history.
+  const check = await checkLock(caller, rev);
+  const histories = [{ kitId: kit.id, row: rev }, ...check.parents];
+  let gated = false;
+  for (const { kitId, row } of histories) if (!gated) gated = await derivesFromSession(caller.env.DB, kitId, row);
+  if (gated) {
     requireInteractive(caller);
-    // Activation would make the kit private; a public kit is forked to a private one instead.
-    if (kit.visibility !== "private") throw conflict("proposal.private_kit_required", "a session-derived revision activates on a private kit only; fork this kit to a private kit");
+    // Both the kit and the visibility the activation writes stay private; a public kit is forked to a private one instead.
+    if (kit.visibility !== "private" || doc.visibility !== "private") {
+      throw conflict("proposal.private_kit_required", "a revision derived from a session-derived revision activates on a private kit, as a private document, only");
+    }
   }
+  // Publishing is a human decision whatever the origin: an API key never makes a kit public.
+  if (doc.visibility !== "private") requireInteractive(caller, "activate a public revision signed in on the web, not with an API key");
   if (rollback && (rev.activated_at === null || rev.id === kit.effective_revision_id)) throw badRequest("rollback targets an earlier effective revision");
   if (!rollback && rev.id === kit.effective_revision_id) throw badRequest("the revision is already effective");
-  const check = await checkLock(caller, rev);
+  // A parent that could not be loaded fails here, so the gate never trusts a lineage it did not read.
   if (check.reasons.length > 0) return incompatible(check.reasons);
-  const doc = documentOf(rev);
   const at = caller.now.getTime();
   // A reviewed proposal keeps its review proof next to the activation approval.
   const review = sessionDerived && rev.approval_json !== null ? (JSON.parse(rev.approval_json) as { review?: unknown }) : null;
