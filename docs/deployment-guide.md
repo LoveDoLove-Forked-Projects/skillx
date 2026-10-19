@@ -300,6 +300,68 @@ var to about `600`; uploads above roughly 580 distinct files are then refused.
 
 Stored R2 objects and release rows are immutable and stay in place.
 
+#### Registry publishing additions (migration 0018)
+
+Idempotent publish, promote, quarantine review, signed download URLs and
+GitHub OIDC trusted publishing live under the release API. Production has had
+`SKILLX_RELEASES_API` set to `"1"` since #70, so these routes are **live as
+soon as the worker deploys**; no other flag holds them back.
+
+1. **Apply migration `0018_registry_publishing` to the remote D1 before
+   deploying. This is mandatory**: publish with an `Idempotency-Key`, the OIDC
+   exchange, trusted publishers and quarantine review read and write these
+   tables, so a worker deployed first answers `500` on them. The migration is
+   additive (four new tables, their indexes and triggers; no existing table
+   changes; rollback SQL is in the migration header):
+   ```bash
+   cd apps/web
+   pnpm run db:migrate:remote
+   ```
+2. Set the token secret (at least 32 characters, random; paste at the prompt).
+   It signs OIDC publish tokens (`sxo_`, 15 min) and artifact download tokens
+   (5 min), domain-separated by purpose. It gates only those two features:
+   without it the OIDC exchange answers `503 oidc.unavailable` and signed
+   download URLs `503`; publishing with API keys, idempotency, promote and
+   quarantine review work without it.
+   ```bash
+   wrangler secret put SKILLX_TOKEN_SECRET --name skillx-web
+   ```
+   Optional var `SKILLX_OIDC_AUDIENCE` (default `skillx`) must match the
+   audience the CLI requests (`--oidc-audience`).
+3. Register the trusted publisher for the AgentKit foundation workflow (admin
+   secret; the repository id comes from `gh api repos/nextlevelbuilder/skillx --jq .id`):
+   ```bash
+   curl -X POST https://skillx.sh/api/v1/publishers/bestagentkits/trusted-publishers \
+     -H "X-Admin-Secret: $ADMIN_SECRET" -H 'Content-Type: application/json' \
+     -d '{"repository":"nextlevelbuilder/skillx","repositoryId":"<id>",
+          "workflowPath":".github/workflows/publish-agentkit-foundation.yml",
+          "ref":"refs/heads/main","environment":"skillx-publish"}'
+   ```
+4. Protect the `skillx-publish` GitHub environment (repository Settings →
+   Environments): deployment branches limited to `main`, and required
+   reviewers, so a maintainer approves every run. The workflow builds the CLI
+   in a job without `id-token` or the environment, and installs the packed
+   CLI in the publish job with lifecycle scripts disabled.
+5. GitHub secrets of the `skillx-publish` environment used by
+   `.github/workflows/publish-agentkit-foundation.yml`:
+   `SKILLX_AGENTKIT_PUBLISH_KEY` (fallback key scoped to
+   `releases:publish:@bestagentkits`) and, while `bestagentkits/agentkit` is
+   private, `AGENTKIT_READ_TOKEN` (read-only contents).
+6. Naming of AgentKit foundation releases: the kit skill directory
+   `kits/<kit>/skills/ak-<x>` is published as `@bestagentkits/<x>` (the `ak-`
+   prefix is dropped), at the `version` of `kits/<kit>/kit.yaml`; the workflow
+   refuses a different version. `@agentkit/*` and `ak-`/`ak:` slugs stay
+   reserved (`403 identity.reserved_publisher` / `identity.reserved_alias`):
+   the signed `skillx.release/v1` manifest cannot carry kit provenance, and
+   AgentKit refuses SkillX releases under `@agentkit`. AgentKit references
+   these releases as `skillx:bestagentkits/<x>`. The release is the skill
+   directory byte for byte, so its `releaseDigest` equals the
+   `agentkit.skill-tree/v1` digest AgentKit computes for that directory.
+
+Rollback: revoke trusted publishers (`POST .../trusted-publishers/{id}/revoke`),
+unset `SKILLX_TOKEN_SECRET` (all outstanding `sxo_` and download tokens stop
+verifying), then follow the rollback above.
+
 #### Release API activation runbook
 
 Run this supervised, by a maintainer, in order. Stop at the first failure.
