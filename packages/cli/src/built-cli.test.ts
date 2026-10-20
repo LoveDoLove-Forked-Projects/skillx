@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { execFile, execFileSync, execSync } from "node:child_process";
+import { execFile, execFileSync, execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { COMPATIBILITY_STATUSES, isCompatibilityActionable } from "@skillx/contracts";
 
 /**
  * Smoke tests of the built CLI, run exactly the way the release ships it: `pnpm build` (tsup) and
@@ -35,6 +36,29 @@ async function cli(...args: string[]) {
   return execFileAsync(process.execPath, [BIN, ...args], { cwd: root, env: childEnv, encoding: "utf8" });
 }
 
+/** Runs the built CLI and keeps a non-zero exit as data, since exit codes are part of the contract. */
+async function cliExit(...args: string[]): Promise<{ code: number; stdout: string }> {
+  try {
+    const { stdout } = await cli(...args);
+    return { code: 0, stdout };
+  } catch (error) {
+    const failed = error as { code?: number; stdout?: string };
+    return { code: failed.code ?? -1, stdout: failed.stdout ?? "" };
+  }
+}
+
+/** Runs the built CLI with `input` on stdin, then closes it; the exit code is data. */
+function cliWithInput(input: string, ...args: string[]): Promise<{ code: number; stdout: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [BIN, ...args], { cwd: root, env: childEnv });
+    let stdout = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code: code ?? -1, stdout }));
+    child.stdin.end(input);
+  });
+}
+
 beforeAll(() => {
   // Through a shell: on Windows pnpm is a .cmd shim that execFile cannot start directly.
   execSync("pnpm build", { cwd: CLI_DIR, stdio: "pipe" });
@@ -58,7 +82,8 @@ afterAll(() => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
-describe("built cli", () => {
+// Each case spawns Node one or more times; under a full parallel run that can pass the 5s default.
+describe("built cli", { timeout: 30_000 }, () => {
   it("keeps the runtime dependencies of bundled workspace packages external", () => {
     const bundledDeps = Object.keys(readJson(join(CLI_DIR, "..", "skill-tree", "package.json")).dependencies ?? {});
     expect(Object.keys(MANIFEST.dependencies)).toEqual(expect.arrayContaining(bundledDeps));
@@ -163,5 +188,189 @@ describe("built cli", () => {
     const help = (await cli("--help")).stdout;
     for (const command of ["import", "validate", "pack", "publish", "promote", "release"]) expect(help).toContain(command);
     expect((await cli("promote", "--help")).stdout).toContain("--to <channel>");
+  });
+
+  it("inlines @skillx/contracts instead of leaving a workspace import", () => {
+    const bundle = readFileSync(BUNDLE, "utf8");
+    expect(bundle).not.toMatch(/["']@skillx\//);
+    expect(bundle).toContain("isCompatibilityActionable");
+  });
+
+  it("answers check --json for all five statuses with the contract's decision and exit code", async () => {
+    const server = createServer((req, res) => {
+      const url = new URL(String(req.url), "http://stub");
+      if (url.pathname === "/api/search") {
+        // One hit for "one hit", none for anything else.
+        let body = "";
+        req.on("data", (chunk) => (body += chunk));
+        req.on("end", () => {
+          const hit = { slug: "s-declared", name: "s-declared", author: "a", category: "c", description: "d" };
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ results: body.includes("one hit") ? [hit] : [] }));
+        });
+        return;
+      }
+      const status = url.pathname.replace("/api/skills/s-", "");
+      if (!(COMPATIBILITY_STATUSES as readonly string[]).includes(status)) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not found" }));
+        return;
+      }
+      const target = { runtime: "agentkit", status, versions: null, scopes: [], requirements: [], evidence: null, reasons: [] };
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ skill: { slug: `s-${status}` }, compatibility: { declared: [], target } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const setUrl = await cliExit("config", "set-url", `http://127.0.0.1:${port}`, "--json");
+      expect(setUrl.code).toBe(0);
+      expect(JSON.parse(setUrl.stdout)).toEqual({ ok: true, data: { baseUrl: `http://127.0.0.1:${port}` } });
+
+      for (const status of COMPATIBILITY_STATUSES) {
+        const { code, stdout } = await cliExit("check", `s-${status}`, "--target", "agentkit@1.2.0", "--json");
+        const envelope = JSON.parse(stdout) as { ok: boolean; data: { status: string; actionable: boolean } };
+        const actionable = isCompatibilityActionable(status);
+        expect(envelope).toMatchObject({ ok: true, data: { status, actionable } });
+        expect(code).toBe(actionable ? 0 : 4);
+      }
+
+      const missing = await cliExit("check", "s-nope", "--target", "agentkit", "--json");
+      expect(missing.code).toBe(3);
+      expect(JSON.parse(missing.stdout)).toMatchObject({ ok: false, error: { code: "not_found" } });
+
+      const nothing = await cliExit("use", "no such skill anywhere", "--json");
+      expect(nothing.code).toBe(3);
+      expect(JSON.parse(nothing.stdout)).toMatchObject({ ok: false, error: { code: "not_found" } });
+
+      // A prompt on a closed stdin is a usage error, not a hang or Node's exit 13.
+      const noPick = await cliWithInput("", "find", "one hit");
+      expect(noPick.code).toBe(2);
+
+      // A piped selection without a trailing newline still selects.
+      const picked = await cliWithInput("1", "find", "one hit");
+      expect(picked.code).toBe(0);
+      expect(picked.stdout).toContain("s-declared");
+      expect(picked.stdout).not.toContain("Cancelled");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  /** Leaf commands from `--help`, walked recursively (`config set-key`, `release pack`, ...). */
+  async function leafCommands(path: string[] = []): Promise<string[][]> {
+    const help = (await cli(...path, "--help")).stdout;
+    const section = help.split(/^Commands:$/m)[1];
+    if (section === undefined) return [path];
+    const names = [...section.matchAll(/^  (\S+)/gm)].map((m) => m[1]!).filter((name) => name !== "help");
+    return (await Promise.all(names.map((name) => leafCommands([...path, name])))).flat();
+  }
+
+  it("offers --json on every command but the stdio MCP server", async () => {
+    const leaves = await leafCommands();
+    expect(leaves.length).toBeGreaterThan(20);
+    const missing = [];
+    for (const leaf of leaves) {
+      if (leaf.join(" ") === "mcp") continue; // speaks MCP on stdio; there is no single result to wrap
+      if (!(await cli(...leaf, "--help")).stdout.includes("--json")) missing.push(leaf.join(" "));
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it.each([
+    [["install", "notaref"], "usage_error", 2],
+    [["list", "--runtime", "zzz"], "usage_error", 2],
+    [["validate", "./nope"], "usage_error", 2],
+    [["pack", "./nope", "--out", "x.tar"], "usage_error", 2],
+    [["promote", "bad", "--to", "stable"], "usage_error", 2],
+    [["import", "not-a-repo"], "usage_error", 2],
+  ])("answers a failing `%s` with one %s envelope and exit %i", async (args, code, exit) => {
+    const result = await cliExit(...args, "--json");
+    expect(result.code).toBe(exit);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code } });
+  });
+
+  it("names the command that could not pack the source", async () => {
+    for (const [command, extra] of [["validate", []], ["pack", ["--out", "x.tar"]]] as const) {
+      const { stdout } = await cliExit(command, "./nope", ...extra, "--json");
+      expect(JSON.parse(stdout).error.message).toMatch(new RegExp(`^cannot ${command} \\./nope:`));
+    }
+  });
+
+  it("answers a registry 429 as rate_limited (exit 7) on install and promote alike", async () => {
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(429, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "rate_limited", message: "slow down" } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const registry = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      for (const args of [["install", "@alpha/demo", "--runtime", "claude-code"], ["promote", "@alpha/demo@1.0.0", "--to", "stable"]]) {
+        const result = await cliExit(...args, "--registry", registry, "--json");
+        expect(result.code).toBe(7);
+        expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, error: { code: "rate_limited" } });
+      }
+    } finally {
+      server.close();
+    }
+  });
+
+  it("reports a parse error as usage_error with exit 2", async () => {
+    const { code, stdout } = await cliExit("check", "some-skill", "--json");
+    expect(code).toBe(2);
+    expect(JSON.parse(stdout)).toMatchObject({ ok: false, error: { code: "usage_error" } });
+  });
+
+  it.each([["help", "check"], ["help", "check", "--json"], ["check", "--help", "--json"]])(
+    "treats `%s %s` as help, exit 0, with no usage_error envelope",
+    async (...args) => {
+      const { code, stdout } = await cliExit(...args);
+      expect(code).toBe(0);
+      expect(stdout).toContain("Usage: skillx check");
+      expect(stdout).not.toContain("usage_error");
+    },
+  );
+
+  it("reports a missing command as usage_error with exit 2", async () => {
+    expect((await cliExit()).code).toBe(2);
+    expect((await cliExit("config")).code).toBe(2);
+  });
+
+  it("reads --json only before --", async () => {
+    const { code, stdout } = await cliExit("check", "--", "--json");
+    expect(code).toBe(2);
+    expect(stdout).not.toContain("usage_error");
+  });
+
+  it.each([["unterminated", "pk_unterminated_9z"], ["newline-terminated", "pk_terminated_9z\n"]])(
+    "saves a %s key piped into config set-key --json",
+    async (_label, input) => {
+      const { code, stdout } = await cliWithInput(input, "config", "set-key", "--json");
+      const envelope = JSON.parse(stdout) as { ok: boolean; data: { saved: boolean; path: string } };
+      expect(code).toBe(0);
+      expect(envelope).toMatchObject({ ok: true, data: { saved: true } });
+      expect(stdout).not.toContain(input.trim());
+      expect(readJson(envelope.data.path).apiKey).toBe(input.trim());
+    },
+  );
+
+  it.each([[""], ["   \n"]])("refuses config set-key --json with no key on stdin (%j) as usage_error", async (input) => {
+    const { code, stdout } = await cliWithInput(input, "config", "set-key", "--json");
+    expect(code).toBe(2);
+    expect(JSON.parse(stdout)).toMatchObject({ ok: false, error: { code: "usage_error" } });
+  });
+
+  it("validates report arguments before any request", async () => {
+    const { code, stdout } = await cliExit("report", "some-skill", "maybe", "--json");
+    expect(code).toBe(2);
+    expect(JSON.parse(stdout)).toMatchObject({ ok: false, error: { code: "usage_error", details: { outcome: "maybe" } } });
+  });
+
+  it("shows config as an envelope without the full key", async () => {
+    const { code, stdout } = await cliExit("config", "show", "--json");
+    const envelope = JSON.parse(stdout) as { ok: boolean; data: { apiKey: { configured: boolean; source: string; masked: string } } };
+    expect(code).toBe(0);
+    expect(envelope.data.apiKey).toMatchObject({ configured: true, source: "env" });
+    expect(stdout).not.toContain("sx_test_smoke_key");
   });
 });

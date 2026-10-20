@@ -11,6 +11,9 @@ import { describe, expect, it, vi } from "vitest";
 
 const authSpy = vi.hoisted(() => vi.fn(async () => ({ userId: "user-with-session" })));
 vi.mock("~/lib/auth/authenticate-request", () => ({ authenticateRequest: authSpy }));
+const keySpy = vi.hoisted(() => vi.fn(async (_db: unknown, key: string) => (key === "sx_good" ? { userId: "user-with-key" } : null)));
+vi.mock("~/lib/auth/authenticate-api-key", () => ({ authenticateApiKey: keySpy }));
+vi.mock("~/lib/db", () => ({ getDb: () => ({}) }));
 
 const callToolSpy = vi.hoisted(() => ({ ctx: [] as Array<{ userId?: string | null }> }));
 vi.mock("~/lib/mcp/tools", async (importOriginal) => {
@@ -28,6 +31,8 @@ import { MCP_PROTOCOL_VERSION, RPC } from "~/lib/mcp/protocol";
 import { MAX_MCP_BODY_BYTES } from "~/lib/mcp/request-body";
 
 const CTX = { cloudflare: { env: {} } };
+const KITS_ON = { SKILLX_PERSONAL_KITS_API: "1" };
+const GET_KIT = JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "get_kit", arguments: { kit: "@a/k" } } });
 
 async function post(body: BodyInit, env: Record<string, unknown> = {}, headers: Record<string, string> = {}) {
   const response = (await action({
@@ -60,12 +65,52 @@ describe("POST /api/mcp", () => {
     expect(json.result.instructions).toContain("never read `unknown` as support");
   });
 
-  it("lists the four read-only tools", async () => {
+  it("lists the five read-only tools", async () => {
     const { response, json } = await post('{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
     expect(response.status).toBe(200);
-    expect(json.result.tools).toHaveLength(4);
-    expect(json.result.tools.map((t: { name: string }) => t.name)).not.toContain("get_kit");
-    expect(json.result.tools.map((t: { name: string }) => t.name)).toContain("check_compatibility");
+    expect(json.result.tools.map((t: { name: string }) => t.name).sort()).toEqual([
+      "check_compatibility",
+      "get_kit",
+      "get_package",
+      "get_release",
+      "search_packages",
+    ]);
+  });
+
+  it("resolves the caller for get_kit only, from the session or an unscoped key", async () => {
+    callToolSpy.ctx.length = 0;
+    await post(GET_KIT, KITS_ON, { Cookie: "session=abc" });
+    await post(GET_KIT, KITS_ON, { Authorization: "Bearer sx_good" });
+    expect(callToolSpy.ctx.map((ctx) => ctx.userId)).toEqual(["user-with-session", "user-with-key"]);
+  });
+
+  it("reports a rejected API key on get_kit as a tool error, never as anonymous", async () => {
+    callToolSpy.ctx.length = 0;
+    const { response, json } = await post(GET_KIT, KITS_ON, { Authorization: "Bearer sx_bad" });
+    expect(response.status).toBe(200);
+    expect(json.result.isError).toBe(true);
+    expect(JSON.parse(json.result.content[0].text).details.code).toBe("invalid_api_key");
+    expect(callToolSpy.ctx).toHaveLength(0);
+  });
+
+  it("answers get_kit with feature_disabled while personal kits are off, without reading credentials", async () => {
+    keySpy.mockClear();
+    const { json } = await post(GET_KIT, {}, { Authorization: "Bearer sx_bad" });
+    expect(json.result.isError).toBe(true);
+    expect(JSON.parse(json.result.content[0].text).details.code).toBe("feature_disabled");
+    expect(keySpy).not.toHaveBeenCalled();
+  });
+
+  it("reports an unexpected viewer failure on get_kit as internal_error, without the cause", async () => {
+    keySpy.mockImplementationOnce(async () => {
+      throw new Error("D1 exploded: secret detail");
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { response, json } = await post(GET_KIT, KITS_ON, { Authorization: "Bearer sx_good" });
+    error.mockRestore();
+    expect(response.status).toBe(200);
+    expect(json.result.isError).toBe(true);
+    expect(JSON.parse(json.result.content[0].text)).toEqual({ error: "get_kit failed", details: { code: "internal_error" } });
   });
 
   it("returns an unknown tool as a JSON-RPC success with isError, not a transport error", async () => {
@@ -78,8 +123,9 @@ describe("POST /api/mcp", () => {
     expect(json.result.isError).toBe(true);
   });
 
-  it("runs every tool as the anonymous viewer and never reads the request's credentials", async () => {
+  it("runs every tool but get_kit as the anonymous viewer and never reads the request's credentials", async () => {
     authSpy.mockClear();
+    keySpy.mockClear();
     callToolSpy.ctx.length = 0;
     for (const name of ["search_packages", "get_package", "check_compatibility", "get_release"]) {
       await post(
@@ -89,6 +135,7 @@ describe("POST /api/mcp", () => {
       );
     }
     expect(authSpy).not.toHaveBeenCalled();
+    expect(keySpy).not.toHaveBeenCalled();
     expect(callToolSpy.ctx).toHaveLength(4);
     expect(callToolSpy.ctx.every((ctx) => ctx.userId === null)).toBe(true);
   });
@@ -109,7 +156,7 @@ describe("POST /api/mcp", () => {
     const { response, json } = await post('{"jsonrpc":"2.0","id":0,"method":"tools/list"}');
     expect(response.status).toBe(200);
     expect(json.id).toBe(0);
-    expect(json.result.tools).toHaveLength(4);
+    expect(json.result.tools).toHaveLength(5);
   });
 
   it("reports malformed JSON as a parse error with a 400", async () => {

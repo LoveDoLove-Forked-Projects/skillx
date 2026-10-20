@@ -64,6 +64,10 @@ Smart skill lookup and display with multiple identifier formats.
 | `-s, --search` | Force search mode regardless of identifier format | `false` |
 | `--include-refs` | Include references in output | `false` |
 | `--include-scripts` | Include scripts in output | `false` |
+| `--json` | Envelope with the resolution (`kind`: `skill` or `repo` scan) and its `notes` | `false` |
+
+When nothing matches, `use` (and `search --use`, `find` after a pick) fails with `not_found`
+and exits `3` in both modes; the human message goes to stderr.
 
 **Resolution Logic:**
 1. Spaces in query → search mode
@@ -129,18 +133,24 @@ Interactive search — browse results and select a skill.
 **Arguments:**
 - `<query>` (required) — Search query string
 
-**Options:** None
+**Options:**
+| Flag | Description |
+|------|-------------|
+| `--json` | Emit the hits as an envelope (`{ query, results, count }`) without prompting |
 
 **Flow:**
 1. Displays numbered results: `[1]`, `[2]`, `[3]`...
 2. Shows name, category, rating, description per result
 3. Prompts: `Select a skill [1-N] or press Enter to cancel:`
-4. Fetches and displays full skill details with content preview (30 lines max)
+4. Shows the selected skill exactly as `skillx use <slug>` would
+
+If stdin closes before a selection (no terminal, empty pipe), `find` fails with `usage_error`
+(exit `2`); use `--json` in scripts.
 
 **Examples:**
 ```bash
 skillx find "testing"
-skillx find "api integration"
+skillx find "api integration" --json
 ```
 
 ---
@@ -161,6 +171,7 @@ warning on stderr, and will be removed.
 | `-p, --path <path>` | Specific skill subfolder path | — |
 | `-s, --scan` | Scan entire repo for all SKILL.md files | `false` |
 | `--dry-run` | Preview what would be imported without calling API | `false` |
+| `--json` | Envelope with the request (dry run) or the register response | `false` |
 
 **Resolution Logic:**
 - No flags → auto-detect (root SKILL.md or scan all)
@@ -183,12 +194,10 @@ skillx import --dry-run
 
 ### Release commands: `validate`, `pack`, `publish`, `promote`
 
-These commands work on immutable, digest-pinned releases. With `--json` they
-print exactly one envelope on stdout, `{"ok": true, "data": {...}}` or
-`{"ok": false, "error": {"code", "message", "details"?, "hint"?}}`, and the
-exit code follows it: `0` ok, `1` registry or unexpected error, `2` usage
-(invalid input or a package the registry would reject), `3` not found, `5`
-credentials missing or rejected, `6` network. `skillx release pack` and
+These commands work on immutable, digest-pinned releases. Like every other
+command they take `--json` and follow
+[JSON Output and Exit Codes](#json-output-and-exit-codes); `2` covers invalid
+input and a package the registry would reject. `skillx release pack` and
 `skillx release publish` remain as aliases of `skillx pack` and
 `skillx publish <dir>`.
 
@@ -308,8 +317,10 @@ Report skill usage outcome (requires API key).
 |------|-------------|---------|
 | `-m, --model <model>` | AI model used (e.g., `claude-sonnet-4`) | — |
 | `-d, --duration <ms>` | Execution duration in milliseconds | — |
+| `--json` | Machine-readable envelope | `false` |
 
-**Requires:** API key configured.
+**Requires:** API key configured. An invalid outcome or duration is a usage error (exit `2`)
+checked before any request; a missing key is `auth_error` (exit `5`).
 
 **Examples:**
 ```bash
@@ -323,6 +334,11 @@ skillx report awesome-skill partial -m gpt-4 -d 2500
 ### `skillx config <subcommand>`
 
 Manage CLI configuration.
+
+All three subcommands accept `--json`. `config show --json` reports the key only as
+`apiKey: { configured, source, masked }`; the plaintext key is never printed. Under
+`set-key --json` the prompt goes to stderr, so stdout stays one envelope. The key may be
+piped on stdin; an empty or closed stdin is a `usage_error` (exit `2`).
 
 #### `skillx config set-key`
 
@@ -545,20 +561,12 @@ the CLI's `--force`.
 
 ### Exit codes
 
-Installer commands print a `{ok, data}` / `{ok, error}` envelope with `--json`.
-
-| Code | Error | Meaning |
-|------|-------|---------|
-| 0 | — | Success |
-| 1 | `integrity_error`, `api_error` | Verification failed (nothing written), or the API failed |
-| 2 | `usage_error` | Bad ref, flag or lock |
-| 3 | `not_found` | Package, release, kit or collection not found |
-| 4 | `incompatible` | The release refuses the runtime |
-| 5 | `auth_error` | Credentials missing or rejected |
-| 6 | `network_error` | Registry unreachable |
-| 8 | `conflict` | Local edits, unowned directory, a link inside a skill, shared version, drift, stale plan, or a path in use |
-
-Code 7 is reserved for `rate_limited` in the shared CLI envelope.
+Installer commands use the shared envelope and the one exit-code table in
+[JSON Output and Exit Codes](#json-output-and-exit-codes). The codes they add
+are `1` `integrity_error` (verification failed, nothing written), `4`
+`incompatible` (the release refuses the runtime) and `8` `conflict` (local
+edits, an unowned directory, a link inside a skill, a shared version, drift, a
+stale plan, or a path in use).
 
 ---
 
@@ -585,22 +593,43 @@ Code 7 is reserved for `rate_limited` in the shared CLI envelope.
 
 ---
 
-## Error Handling
+## JSON Output and Exit Codes
 
-| Scenario | Message |
-|----------|---------|
-| 401 Unauthorized | "Authentication failed. Check your API key." |
-| 403 Forbidden | "Permission denied. Must be collaborator/owner of repo." |
-| 404 Not Found | "Skill not found: `<slug>`" / "No SKILL.md found in repository." |
-| 429 Rate Limited | "Rate limited. Please try again later." |
-| Invalid outcome | "Invalid outcome. Must be: success, failure, or partial" |
-| Missing API key | "API key required. Run `skillx config set-key`" |
-| Invalid URL | "Invalid URL format. Example: https://api.skillx.sh" |
+Every command, the release and installer commands included, accepts `--json` and then
+writes exactly one envelope to stdout; spinners and prompts never reach stdout in that mode.
+The one exception is `skillx mcp`, which speaks MCP on stdio and has no single result to
+wrap.
 
-Legacy commands exit with code 1 on error; installer commands use the typed
-[exit codes](#exit-codes) above.
+```json
+{ "ok": true, "data": { "...": "command-specific payload" } }
+{ "ok": false, "error": { "code": "not_found", "message": "...", "hint": "...", "details": {} } }
+```
 
----
+`hint` and `details` appear only when there is something concrete to say. The exit code
+carries the same answer, so a script can branch without parsing either form:
+
+| Exit | `error.code` | Meaning |
+|------|--------------|---------|
+| `0` | — | Success (`check`: the target may be acted on) |
+| `1` | `api_error`, `unexpected_error`, `integrity_error` | The API failed without a better class, a bug, or a release failed verification (nothing written) |
+| `2` | `usage_error` | Invalid arguments or options, unknown command, missing argument |
+| `3` | `not_found` | The skill, package, release, kit or collection does not exist |
+| `4` | `incompatible` | The target may not act on the skill. `check` answers it on a success envelope (`data.actionable: false`); the installer fails with `incompatible` |
+| `5` | `auth_error` | API key missing or rejected (`401`/`403`); the hint names `skillx config set-key` |
+| `6` | `network_error` | The API could not be reached |
+| `7` | `rate_limited` | The API answered `429`; retry later |
+| `8` | `conflict` | Installer only: the change would overwrite something it does not own (see [Exit codes](#exit-codes)) |
+
+For `check`, exit `4` is an answer, not a failure, so its envelope is a success. Only flags before `--`
+count: `skillx check -- --json` treats `--json` as an operand.
+
+Parse failures follow the same table: with `--json` on the command line, an unknown option
+prints a `usage_error` envelope and exits `2`. `--help`, `help <command>` and `--version` exit
+`0`; a bare `skillx` or a group without its subcommand (`skillx config`) prints help and exits
+`2`. The
+implementation lives in [`output.ts`](../packages/cli/src/lib/output.ts) and
+[`run-command.ts`](../packages/cli/src/lib/run-command.ts); a command wraps its work in
+`runCommand` and throws `CliError` for failures it classifies itself.
 
 ## GoClaw / AI Agent Integration
 
