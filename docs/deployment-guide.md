@@ -470,7 +470,10 @@ document in R2 under `statuses/sha256/`. Rollback: the header SQL of
 **Personal kits API.** `/api/v1/kits/...` needs migrations 0015 and 0016
 (personal kit tables and proposals) plus the release read stack
 (`SKILLX_RELEASES_API`). Production runs with `SKILLX_PERSONAL_KITS_API` set to
-`"1"` in `apps/web/wrangler.jsonc`. Before enabling it on another deployment,
+`"1"` in `apps/web/wrangler.jsonc`. Until the Worker var
+`SKILLX_SHARED_SKILL_ALIASES` lists at least one identity, every in-place
+overlay of an `@agentkit/*` skill answers `422 overlay.shared_alias` (see the
+[personal kits API](./personal-kits-api.md)). Before enabling it on another deployment,
 confirm that `wrangler d1 migrations list skillx-db --remote` reports nothing
 pending. Rollback: set the flag to `"0"` and redeploy; every route answers 404
 `kit.api_disabled` and stored kits stay untouched.
@@ -480,13 +483,13 @@ pending. Rollback: set the flag to `"0"` and redeploy; every route answers 404
 AgentKit's shared-skill list first: the non-`ak-` skills that `kits/core` or
 more than one official kit ships (for example `@agentkit/plan`). Kit releases
 are published without the `ak-` prefix (`@agentkit/plan`; `@agentkit/ak-*` is
-`400 identity.invalid`), so only the `ak-` names are shared by default. While
-the variable is unset, a public personal kit may overlay any other
-`@agentkit/<name>` skill in place. That is by design
-([personal kits API](./personal-kits-api.md)) and the result stays
-`local-unverified`, but it lets a third-party kit override a skill every
-official kit shares. Confirm with an overlay of a listed identity, which must
-answer `422 overlay.shared_alias`. Kit releases also need skillx-sh 0.7.0 or
+`400 identity.invalid`). While the variable holds no valid identity, the
+guard fails closed and refuses every in-place overlay of an `@agentkit/*`
+skill, including single-kit skills that may legitimately be overlaid
+([personal kits API](./personal-kits-api.md)); setting the list is what
+unblocks those. Use identities, not bare aliases: an entry such as `plan` is
+ignored. Confirm with an overlay of a listed identity, which must answer
+`422 overlay.shared_alias` without naming the variable in its detail. Kit releases also need skillx-sh 0.7.0 or
 later on the client: 0.6.0 and earlier report `skillx.release/v2` manifests as
 failed verification, so say so in the release notes of the first kit release.
 
