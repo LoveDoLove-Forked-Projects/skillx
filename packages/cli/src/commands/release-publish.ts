@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import chalk from 'chalk';
+import { KIT_ORIGINS } from '@skillx/skill-tree';
 import { getBaseUrl } from '../utils/config-store.js';
 import { CliError, parsePackageName, publishCredential, registryFetch, runCommand, usageError } from '../lib/release-cli.js';
 import { createPackCommand, packOrFail } from './pack.js';
@@ -48,6 +49,26 @@ export function assertRegistryDigests(
   }
 }
 
+/**
+ * The `provenance` metadata of a publish: a kit release (`--kit-origin`) must
+ * be `@agentkit/*` and is signed as `skillx.release/v2`; without the flag the
+ * release is provider `skillx` (v1) and `@agentkit/*` stays reserved.
+ */
+export function kitProvenance(publisher: string, kitOrigin: string | undefined): { provider: 'kit'; origin: string } | undefined {
+  if (kitOrigin === undefined) return undefined;
+  if (!(KIT_ORIGINS as readonly string[]).includes(kitOrigin)) {
+    throw new Error(`--kit-origin must be one of: ${KIT_ORIGINS.join(', ')}`);
+  }
+  if (publisher !== 'agentkit') throw new Error('--kit-origin is only for @agentkit/* kit releases');
+  return { provider: 'kit', origin: kitOrigin };
+}
+
+/** The base64 `X-SkillX-Release` header; `provenance` is sent only for a kit release. */
+export function releaseMetadataHeader({ provenance, ...fields }: Record<string, unknown> & { provenance?: unknown }): string {
+  const metadata = provenance === undefined ? fields : { ...fields, provenance };
+  return Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64');
+}
+
 function originUrl(repoRoot: string): string | null {
   const result = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: repoRoot, encoding: 'utf8' });
   return result.status === 0 ? httpsRepoUrl(result.stdout) : null;
@@ -60,6 +81,7 @@ export interface ReleasePublishOptions {
   channel: string;
   kind: string;
   repo?: string;
+  kitOrigin?: string;
   script: string[];
   registry?: string;
   idempotencyKey?: string;
@@ -83,6 +105,12 @@ export function resolveRegistry(raw: string | undefined): string {
 export async function runReleasePublish(input: string, options: ReleasePublishOptions) {
   const name = parsePackageName(options.name);
   if (!options.releaseVersion) throw usageError('--release-version is required, e.g. 1.0.0');
+  let provenance: ReturnType<typeof kitProvenance>;
+  try {
+    provenance = kitProvenance(name.handle, options.kitOrigin);
+  } catch (error) {
+    throw usageError((error as Error).message);
+  }
   if (options.repo !== undefined && httpsRepoUrl(options.repo) !== options.repo) {
     throw usageError('--repo must be an https URL without credentials or a trailing .git');
   }
@@ -92,17 +120,17 @@ export async function runReleasePublish(input: string, options: ReleasePublishOp
   const repo = options.repo ?? originUrl(packed.source.repoRoot);
   if (repo === null) console.error(chalk.yellow('warning: no https origin remote; the release will record no source provenance'));
 
-  const metadata = {
-    version: options.releaseVersion,
-    channel: options.channel,
-    kind: options.kind,
-    sourceProvenance: repo === null ? null : { repo, commit: packed.commit, path: packed.path },
-    declaredScripts: [...options.script].sort(),
-  };
   const headers: Record<string, string> = {
     Authorization: `Bearer ${credential}`,
     'Content-Type': 'application/x-tar',
-    'X-SkillX-Release': Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64'),
+    'X-SkillX-Release': releaseMetadataHeader({
+      version: options.releaseVersion,
+      channel: options.channel,
+      kind: options.kind,
+      sourceProvenance: repo === null ? null : { repo, commit: packed.commit, path: packed.path },
+      declaredScripts: [...options.script].sort(),
+      provenance,
+    }),
   };
   if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
   const body = await registryFetch(`${base}/api/v1/packages/@${name.handle}/${name.slug}/releases`, { method: 'POST', headers, body: packed.tar });
@@ -130,6 +158,7 @@ export function withReleasePublishOptions(command: Command): Command {
     .option('--channel <channel>', 'stable | beta | alpha', 'stable')
     .option('--kind <kind>', 'skill | hook-pack | bundle', 'skill')
     .option('--repo <https-url>', 'source repository URL for provenance (default: git remote origin)')
+    .option('--kit-origin <origin>', 'publish an @agentkit/* kit release with this origin: remote-signed | local-dev (needs a releases:publish:@agentkit key)')
     .option('--script <path>', 'declare a packaged file as a script (repeatable)', collect, [])
     .option('--registry <url>', 'registry base URL (default: configured base URL)')
     .option('--idempotency-key <key>', 'Idempotency-Key header: a retry with the same key replays the first answer')
