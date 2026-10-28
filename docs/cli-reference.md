@@ -447,6 +447,7 @@ the release read API; nothing is written until every file is verified.
 | `kit:@handle/kit#rev_<uuid>` | That exact kit revision |
 | `collection:col_<uuid>[#n]` | Revision `n` of a collection (default `latest`) |
 | `@publisher/package[@version] ...` | Explicit packages (newest stable release when no version) |
+| `@publisher/package@version#sha256:<hex>` | That version, only if its release digest is still the pinned one; a different digest is an `integrity_error` and nothing is installed |
 
 ### Runtimes (`--runtime`)
 
@@ -479,6 +480,11 @@ is sent only over `https`; plain `http` is refused except for `localhost`,
   collection. Package installs merge into a packages lock (by alias); a kit or
   collection install replaces its own lock. Installing into a lock of another
   scope is a `usage_error` (pass `--lock other.json` or `--no-lock`).
+  Nothing in a release is ever run: files the release marks executable are
+  written with mode 755 and listed on stderr (`--json`: `executable` on each
+  changed skill) after the install. `--dry-run` previews the files that would
+  be written; the executable files and declared permissions to review before
+  installing come from the MCP `prepare_install` answer (`trust`).
 - **update** re-resolves installed sources (all, or those named) and applies the
   difference, then refreshes the lock file when its scope was updated. With
   nothing installed it prints `Nothing to update.` (`--json`: empty `outcomes`).
