@@ -3,7 +3,7 @@ import { execFile, execFileSync, execSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -356,6 +356,56 @@ describe("built cli", { timeout: 30_000 }, () => {
     const names = [...section.matchAll(/^  (\S+)/gm)].map((m) => m[1]!).filter((name) => name !== "help");
     return (await Promise.all(names.map((name) => leafCommands([...path, name])))).flat();
   }
+
+  it("add installs a local skill through the installer as one envelope, with installer exit codes", async () => {
+    const home = join(root, "add-home");
+    const env = { ...childEnv, HOME: home, USERPROFILE: home, SKILLX_HOME: join(home, ".skillx"), CLAUDE_CONFIG_DIR: join(home, ".claude") };
+    const run = async (...args: string[]) => {
+      try {
+        return { code: 0, stdout: (await execFileAsync(process.execPath, [BIN, ...args], { cwd: root, env, encoding: "utf8" })).stdout };
+      } catch (error) {
+        const failed = error as { code?: number; stdout?: string };
+        return { code: failed.code ?? -1, stdout: failed.stdout ?? "" };
+      }
+    };
+    const src = join(root, "add-src");
+    mkdirSync(join(src, "references"), { recursive: true });
+    writeFileSync(join(src, "SKILL.md"), "---\nname: smoke-skill\ndescription: Built CLI smoke\n---\n# Smoke\n");
+    writeFileSync(join(src, "references", "notes.md"), "notes\n");
+    const listed = JSON.parse((await run("add", src, "--list", "--json")).stdout) as { ok: true; data: { status: string; skills: Array<{ name: string }> } };
+    expect(listed.data).toMatchObject({ status: "listed", skills: [{ name: "smoke-skill" }] });
+
+    const installed = await run("add", src, "--json");
+    expect(installed.code).toBe(0);
+    expect(JSON.parse(installed.stdout)).toMatchObject({ ok: true, data: { status: "installed", skills: [{ alias: "smoke-skill" }] } });
+    expect(readFileSync(join(home, ".claude", "skills", "smoke-skill", "references", "notes.md"), "utf8")).toBe("notes\n");
+    const owners = JSON.parse((await run("list", "--json")).stdout) as { data: { sources: Array<{ owner: string }> } };
+    expect(owners.data.sources.map((s) => s.owner)).toEqual(["add:smoke-skill"]);
+
+    // The same name from a changed tree is a conflict (exit 8) until --force.
+    writeFileSync(join(src, "SKILL.md"), "---\nname: smoke-skill\ndescription: Built CLI smoke v2\n---\n");
+    const conflict = await run("add", src, "--json");
+    expect(conflict.code).toBe(8);
+    expect(JSON.parse(conflict.stdout)).toMatchObject({ ok: false, error: { code: "conflict" } });
+    expect((await run("add", src, "--force", "--json")).code).toBe(0);
+    expect((await run("uninstall", "add:smoke-skill", "--json")).code).toBe(0);
+
+    // Human mode on a piped stdin cannot ask: a usage error, never a silent exit-0 cancel.
+    const piped = await run("add", src);
+    expect(piped.code).toBe(2);
+    expect(piped.stdout).not.toContain("Cancelled");
+    expect(existsSync(join(home, ".claude", "skills", "smoke-skill"))).toBe(false);
+
+    const missing = await run("add", join(root, "no-such-dir"), "--json");
+    expect(missing.code).toBe(2);
+    expect(JSON.parse(missing.stdout)).toMatchObject({ ok: false, error: { code: "usage_error" } });
+    // Human mode fails and exits too; nothing keeps the process alive.
+    expect((await run("add", "ext::sh -c id")).code).toBe(2);
+    const token = "ghp_SECRETTOKEN123";
+    const leaked = await run("add", `http://user:${token}@127.0.0.1:9/x.git`, "--json");
+    expect(leaked.code).toBe(2);
+    expect(leaked.stdout).not.toContain(token);
+  });
 
   it("offers --json on every command but the stdio MCP server", async () => {
     const leaves = await leafCommands();
